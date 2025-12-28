@@ -445,4 +445,12 @@ micro_profit_maker_config_map = {
                       "split_order_levels_enabled").value,
                   type_str="str",
                   validator=validate_decimal_list),
+
+    # --- risk controls ---
+    "emergency_stop":
+        ConfigVar(key="emergency_stop",
+                  prompt="Emergency stop (cancel all orders and halt trading)? (Yes/No) >>> ",
+                  type_str="bool",
+                  default=False,
+                  validator=validate_bool),
 }

@@ -74,6 +74,17 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         str _mfm_stop_order_id
         bint _mfm_stop_loss_in_progress
 
+        # --- risk controls ---
+        bint _mfm_trading_paused
+        bint _mfm_emergency_stop
+        object _mfm_daily_pnl_pct
+        int _mfm_consecutive_losses
+        int64_t _mfm_day_id
+
+        # average close price accumulator for exit/stop
+        object _mfm_close_price_num
+        object _mfm_close_amount
+
     cdef object c_get_mid_price(self)
     cdef object c_create_base_proposal(self)
     cdef tuple c_get_adjusted_available_balance(self, list orders)

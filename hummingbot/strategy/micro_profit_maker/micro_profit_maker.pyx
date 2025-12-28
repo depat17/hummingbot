@@ -86,7 +86,8 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                     bid_order_level_spreads: List[Decimal] = None,
                     ask_order_level_spreads: List[Decimal] = None,
                     should_wait_order_cancel_confirmation: bool = True,
-                    moving_price_band: Optional[MovingPriceBand] = None
+                    moving_price_band: Optional[MovingPriceBand] = None,
+                    emergency_stop: bool = False
                     ):
         if order_override is None:
             order_override = {}
@@ -164,6 +165,15 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         self._mfm_exit_order_id = ""
         self._mfm_stop_order_id = ""
         self._mfm_stop_loss_in_progress = False
+
+        # --- risk controls ---
+        self._mfm_trading_paused = False
+        self._mfm_emergency_stop = emergency_stop
+        self._mfm_daily_pnl_pct = Decimal("0")
+        self._mfm_consecutive_losses = 0
+        self._mfm_day_id = <int64_t>(self._current_timestamp // 86400.0) if self._current_timestamp > 0 else 0
+        self._mfm_close_price_num = Decimal("0")
+        self._mfm_close_amount = Decimal("0")
 
     def all_markets_ready(self):
         return all([market.ready for market in self._sb_markets])
@@ -753,9 +763,43 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
 
         return spread_pct > total_fee_pct and spread_pct >= (total_fee_pct + self._mfm_target_profit_pct)
 
-    cdef c_mfm_cancel_all_active_non_hanging_orders(self):
-        for order in self.active_non_hanging_orders:
+    cdef c_mfm_cancel_all_orders(self):
+        """
+        Cancel all active orders (including hanging orders if enabled).
+        """
+        for order in self.active_orders:
             self.c_cancel_order(self._market_info, order.client_order_id)
+
+    cdef c_mfm_trigger_halt(self, str reason):
+        """
+        Cancel all orders and halt trading. If a position is open, attempt an emergency market close to keep inventory near zero.
+        """
+        if not self._mfm_trading_paused:
+            self.logger().warning(f"micro_profit_maker halted: {reason}")
+        self._mfm_trading_paused = True
+
+        # Cancel all orders immediately
+        self._mfm_entry_order_id = ""
+        self._mfm_exit_order_id = ""
+        self.c_mfm_cancel_all_orders()
+
+        # If holding a position, force-close at market once
+        if self._mfm_position_side is not None and self._mfm_position_amount > 0 and not self._mfm_stop_loss_in_progress:
+            if self._mfm_position_side is TradeType.BUY:
+                self._mfm_stop_order_id = self.c_sell_with_specific_market(
+                    self._market_info,
+                    self._mfm_position_amount,
+                    order_type=OrderType.MARKET,
+                    price=s_decimal_nan,
+                )
+            else:
+                self._mfm_stop_order_id = self.c_buy_with_specific_market(
+                    self._market_info,
+                    self._mfm_position_amount,
+                    order_type=OrderType.MARKET,
+                    price=s_decimal_nan,
+                )
+            self._mfm_stop_loss_in_progress = True
 
     cdef c_mfm_place_exit_order(self):
         cdef:
@@ -887,6 +931,31 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 self.c_mfm_place_exit_order()
                 return
 
+            # Reset daily counters on day change (UTC days based on epoch seconds)
+            current_day_id = <int64_t>(self._current_timestamp // 86400.0)
+            if current_day_id != self._mfm_day_id:
+                self._mfm_day_id = current_day_id
+                self._mfm_daily_pnl_pct = Decimal("0")
+                self._mfm_consecutive_losses = 0
+
+            # Emergency stop (config)
+            if self._mfm_emergency_stop:
+                self.c_mfm_trigger_halt("emergency_stop enabled")
+                return
+
+            # Hard halt state
+            if self._mfm_trading_paused:
+                self.c_mfm_cancel_all_orders()
+                return
+
+            # Risk limits
+            if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
+                return
+            if self._mfm_consecutive_losses >= 3:
+                self.c_mfm_trigger_halt("3 consecutive losses")
+                return
+
             # Flat: allow at most one resting entry order; otherwise cancel leftovers
             if self._mfm_entry_order_id != "" and self._mfm_entry_order_id not in [o.client_order_id for o in self.active_orders]:
                 # Entry order no longer active (canceled/failed)
@@ -900,7 +969,7 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                     return
                 # Unexpected/stale orders while flat: cancel to avoid accumulating inventory
                 self._mfm_entry_order_id = ""
-                self.c_mfm_cancel_all_active_non_hanging_orders()
+                self.c_mfm_cancel_all_orders()
                 return
 
             # Respect trade rate limit
@@ -1234,6 +1303,15 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         self._mfm_trade_timestamps.append(self._current_timestamp)
         self.c_mfm_prune_trade_timestamps()
 
+        # Track average close price for exit/stop orders so we can compute realized PnL at completion
+        if order_id != "" and (order_id == self._mfm_exit_order_id or order_id == self._mfm_stop_order_id):
+            try:
+                self._mfm_close_price_num += (order_filled_event.price * order_filled_event.amount)
+                self._mfm_close_amount += order_filled_event.amount
+            except Exception:
+                # Avoid breaking event handler on unexpected types
+                pass
+
         if market_info is not None:
             limit_order_record = self._sb_order_tracker.c_get_shadow_limit_order(order_id)
             order_fill_record = (limit_order_record, order_filled_event)
@@ -1263,6 +1341,21 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         # --- micro_profit_maker position state management ---
         # Stop-loss forced close for SHORT positions uses a MARKET BUY
         if self._mfm_stop_order_id != "" and order_id == self._mfm_stop_order_id:
+            # Realized PnL for SHORT close (entry SELL -> close BUY)
+            if self._mfm_position_side is TradeType.SELL and self._mfm_entry_price > 0 and self._mfm_close_amount > 0:
+                close_price = self._mfm_close_price_num / self._mfm_close_amount
+                pnl_pct = (self._mfm_entry_price - close_price) / self._mfm_entry_price
+                self._mfm_daily_pnl_pct += pnl_pct
+                if pnl_pct < 0:
+                    self._mfm_consecutive_losses += 1
+                else:
+                    self._mfm_consecutive_losses = 0
+
+                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                    self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
+                elif self._mfm_consecutive_losses >= 3:
+                    self.c_mfm_trigger_halt("3 consecutive losses")
+
             self._mfm_stop_order_id = ""
             self._mfm_stop_loss_in_progress = False
             self._mfm_position_side = None
@@ -1270,16 +1363,34 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
             self._mfm_position_amount = s_decimal_zero
             self._mfm_entry_order_id = ""
             self._mfm_exit_order_id = ""
+            self._mfm_close_price_num = Decimal("0")
+            self._mfm_close_amount = Decimal("0")
             return
 
         # Exit for SHORT positions is a BUY
         if self._mfm_exit_order_id != "" and order_id == self._mfm_exit_order_id and self._mfm_position_side is TradeType.SELL:
+            if self._mfm_entry_price > 0 and self._mfm_close_amount > 0:
+                close_price = self._mfm_close_price_num / self._mfm_close_amount
+                pnl_pct = (self._mfm_entry_price - close_price) / self._mfm_entry_price
+                self._mfm_daily_pnl_pct += pnl_pct
+                if pnl_pct < 0:
+                    self._mfm_consecutive_losses += 1
+                else:
+                    self._mfm_consecutive_losses = 0
+
+                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                    self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
+                elif self._mfm_consecutive_losses >= 3:
+                    self.c_mfm_trigger_halt("3 consecutive losses")
+
             self._mfm_position_side = None
             self._mfm_entry_price = s_decimal_zero
             self._mfm_position_amount = s_decimal_zero
             self._mfm_entry_order_id = ""
             self._mfm_exit_order_id = ""
             self._mfm_stop_loss_in_progress = False
+            self._mfm_close_price_num = Decimal("0")
+            self._mfm_close_amount = Decimal("0")
             return
 
         # Entry BUY opens a LONG position, then we place a take-profit SELL
@@ -1291,7 +1402,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 self._mfm_entry_order_id = ""
                 self._mfm_exit_order_id = ""
                 self._mfm_stop_loss_in_progress = False
-                self.c_mfm_cancel_all_active_non_hanging_orders()
+                self.c_mfm_cancel_all_orders()
+                self._mfm_close_price_num = Decimal("0")
+                self._mfm_close_amount = Decimal("0")
                 self.c_mfm_place_exit_order()
 
         if limit_order_record is None:
@@ -1338,6 +1451,21 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         # --- micro_profit_maker position state management ---
         # Stop-loss forced close for LONG positions uses a MARKET SELL
         if self._mfm_stop_order_id != "" and order_id == self._mfm_stop_order_id:
+            # Realized PnL for LONG close (entry BUY -> close SELL)
+            if self._mfm_position_side is TradeType.BUY and self._mfm_entry_price > 0 and self._mfm_close_amount > 0:
+                close_price = self._mfm_close_price_num / self._mfm_close_amount
+                pnl_pct = (close_price - self._mfm_entry_price) / self._mfm_entry_price
+                self._mfm_daily_pnl_pct += pnl_pct
+                if pnl_pct < 0:
+                    self._mfm_consecutive_losses += 1
+                else:
+                    self._mfm_consecutive_losses = 0
+
+                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                    self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
+                elif self._mfm_consecutive_losses >= 3:
+                    self.c_mfm_trigger_halt("3 consecutive losses")
+
             self._mfm_stop_order_id = ""
             self._mfm_stop_loss_in_progress = False
             self._mfm_position_side = None
@@ -1345,16 +1473,34 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
             self._mfm_position_amount = s_decimal_zero
             self._mfm_entry_order_id = ""
             self._mfm_exit_order_id = ""
+            self._mfm_close_price_num = Decimal("0")
+            self._mfm_close_amount = Decimal("0")
             return
 
         # Exit for LONG positions is a SELL
         if self._mfm_exit_order_id != "" and order_id == self._mfm_exit_order_id and self._mfm_position_side is TradeType.BUY:
+            if self._mfm_entry_price > 0 and self._mfm_close_amount > 0:
+                close_price = self._mfm_close_price_num / self._mfm_close_amount
+                pnl_pct = (close_price - self._mfm_entry_price) / self._mfm_entry_price
+                self._mfm_daily_pnl_pct += pnl_pct
+                if pnl_pct < 0:
+                    self._mfm_consecutive_losses += 1
+                else:
+                    self._mfm_consecutive_losses = 0
+
+                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                    self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
+                elif self._mfm_consecutive_losses >= 3:
+                    self.c_mfm_trigger_halt("3 consecutive losses")
+
             self._mfm_position_side = None
             self._mfm_entry_price = s_decimal_zero
             self._mfm_position_amount = s_decimal_zero
             self._mfm_entry_order_id = ""
             self._mfm_exit_order_id = ""
             self._mfm_stop_loss_in_progress = False
+            self._mfm_close_price_num = Decimal("0")
+            self._mfm_close_amount = Decimal("0")
             return
 
         # Entry SELL opens a SHORT position, then we place a take-profit BUY
@@ -1366,7 +1512,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 self._mfm_entry_order_id = ""
                 self._mfm_exit_order_id = ""
                 self._mfm_stop_loss_in_progress = False
-                self.c_mfm_cancel_all_active_non_hanging_orders()
+                self.c_mfm_cancel_all_orders()
+                self._mfm_close_price_num = Decimal("0")
+                self._mfm_close_amount = Decimal("0")
                 self.c_mfm_place_exit_order()
 
         if limit_order_record is None:

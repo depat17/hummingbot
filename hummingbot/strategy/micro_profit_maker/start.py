@@ -98,6 +98,7 @@ async def start(self):
         take_if_crossed = c_map.get("take_if_crossed").value
 
         should_wait_order_cancel_confirmation = c_map.get("should_wait_order_cancel_confirmation")
+        emergency_stop = c_map.get("emergency_stop").value
 
         strategy_logging_options = MicroProfitMakerStrategy.OPTION_LOG_ALL
         self.strategy = MicroProfitMakerStrategy()
@@ -137,7 +138,8 @@ async def start(self):
             bid_order_level_spreads=bid_order_level_spreads,
             ask_order_level_spreads=ask_order_level_spreads,
             should_wait_order_cancel_confirmation=should_wait_order_cancel_confirmation,
-            moving_price_band=moving_price_band
+            moving_price_band=moving_price_band,
+            emergency_stop=emergency_stop,
         )
     except Exception as e:
         self.notify(str(e))
