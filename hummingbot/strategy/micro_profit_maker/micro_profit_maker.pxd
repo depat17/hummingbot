@@ -78,7 +78,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         bint _mfm_trading_paused
         bint _mfm_emergency_stop
         object _mfm_daily_pnl_pct
+        object _mfm_max_daily_loss_pct
         int _mfm_consecutive_losses
+        int _mfm_max_consecutive_losses
         int64_t _mfm_day_id
 
         # average close price accumulator for exit/stop

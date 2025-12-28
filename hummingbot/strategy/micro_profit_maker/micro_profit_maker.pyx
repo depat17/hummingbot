@@ -87,7 +87,12 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                     ask_order_level_spreads: List[Decimal] = None,
                     should_wait_order_cancel_confirmation: bool = True,
                     moving_price_band: Optional[MovingPriceBand] = None,
-                    emergency_stop: bool = False
+                    emergency_stop: bool = False,
+                    target_profit_pct: Decimal = Decimal("0.0005"),
+                    stop_loss_pct: Decimal = Decimal("0.0010"),
+                    max_trades_per_minute: int = 5,
+                    max_daily_loss_pct: Decimal = Decimal("0.01"),
+                    max_consecutive_losses: int = 3
                     ):
         if order_override is None:
             order_override = {}
@@ -148,13 +153,10 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         self._moving_price_band = moving_price_band
         self.c_add_markets([market_info.market])
 
-        # --- micro_profit_maker behavior overrides ---
-        # Target fixed profit per round-trip trade: +0.05% (5 bps)
-        # Stop loss: -0.10% (10 bps)
-        # Max trade events: 5 fills per 60 seconds window
-        self._mfm_target_profit_pct = Decimal("0.0005")
-        self._mfm_stop_loss_pct = Decimal("0.0010")
-        self._mfm_max_trades_per_minute = 5
+        # --- micro_profit_maker behavior overrides (configured) ---
+        self._mfm_target_profit_pct = target_profit_pct
+        self._mfm_stop_loss_pct = stop_loss_pct
+        self._mfm_max_trades_per_minute = max_trades_per_minute
         self._mfm_trade_timestamps = deque()
 
         # Position state (keep inventory ~0 by allowing only one position at a time)
@@ -170,7 +172,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         self._mfm_trading_paused = False
         self._mfm_emergency_stop = emergency_stop
         self._mfm_daily_pnl_pct = Decimal("0")
+        self._mfm_max_daily_loss_pct = max_daily_loss_pct
         self._mfm_consecutive_losses = 0
+        self._mfm_max_consecutive_losses = max_consecutive_losses
         self._mfm_day_id = <int64_t>(self._current_timestamp // 86400.0) if self._current_timestamp > 0 else 0
         self._mfm_close_price_num = Decimal("0")
         self._mfm_close_amount = Decimal("0")
@@ -949,10 +953,10 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 return
 
             # Risk limits
-            if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+            if self._mfm_daily_pnl_pct <= (-self._mfm_max_daily_loss_pct):
                 self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
                 return
-            if self._mfm_consecutive_losses >= 3:
+            if self._mfm_consecutive_losses >= self._mfm_max_consecutive_losses:
                 self.c_mfm_trigger_halt("3 consecutive losses")
                 return
 
@@ -1351,9 +1355,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 else:
                     self._mfm_consecutive_losses = 0
 
-                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                if self._mfm_daily_pnl_pct <= (-self._mfm_max_daily_loss_pct):
                     self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
-                elif self._mfm_consecutive_losses >= 3:
+                elif self._mfm_consecutive_losses >= self._mfm_max_consecutive_losses:
                     self.c_mfm_trigger_halt("3 consecutive losses")
 
             self._mfm_stop_order_id = ""
@@ -1378,9 +1382,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 else:
                     self._mfm_consecutive_losses = 0
 
-                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                if self._mfm_daily_pnl_pct <= (-self._mfm_max_daily_loss_pct):
                     self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
-                elif self._mfm_consecutive_losses >= 3:
+                elif self._mfm_consecutive_losses >= self._mfm_max_consecutive_losses:
                     self.c_mfm_trigger_halt("3 consecutive losses")
 
             self._mfm_position_side = None
@@ -1461,9 +1465,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 else:
                     self._mfm_consecutive_losses = 0
 
-                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                if self._mfm_daily_pnl_pct <= (-self._mfm_max_daily_loss_pct):
                     self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
-                elif self._mfm_consecutive_losses >= 3:
+                elif self._mfm_consecutive_losses >= self._mfm_max_consecutive_losses:
                     self.c_mfm_trigger_halt("3 consecutive losses")
 
             self._mfm_stop_order_id = ""
@@ -1488,9 +1492,9 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                 else:
                     self._mfm_consecutive_losses = 0
 
-                if self._mfm_daily_pnl_pct <= Decimal("-0.01"):
+                if self._mfm_daily_pnl_pct <= (-self._mfm_max_daily_loss_pct):
                     self.c_mfm_trigger_halt("max daily loss reached (<= -1%)")
-                elif self._mfm_consecutive_losses >= 3:
+                elif self._mfm_consecutive_losses >= self._mfm_max_consecutive_losses:
                     self.c_mfm_trigger_halt("3 consecutive losses")
 
             self._mfm_position_side = None

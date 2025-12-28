@@ -87,6 +87,30 @@ order_level_spread: null
 # How long to wait before placing the next order in case your order gets filled.
 filled_order_delay: null
 
+# ----------------------------
+# Micro-profit-maker parameters
+# ----------------------------
+#
+# All percentages below are in "%", so 0.05 means 0.05%.
+
+# Target profit per trade (%)
+target_profit_pct: 0.05
+
+# Stop loss per trade (%)
+stop_loss_pct: 0.10
+
+# Maximum number of trade fills per minute
+max_trades_per_minute: 5
+
+# Max daily loss (%) after which trading is halted
+max_daily_loss_pct: 1
+
+# Pause trading after N consecutive losses
+max_consecutive_losses: 3
+
+# Emergency stop (if true, cancel all orders and halt trading)
+emergency_stop: false
+
 # Whether to stop cancellations of orders on the other side (of the order book),
 # when one side is filled (hanging orders feature) (true/false).
 hanging_orders_enabled: null

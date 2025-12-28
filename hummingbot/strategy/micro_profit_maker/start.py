@@ -99,6 +99,11 @@ async def start(self):
 
         should_wait_order_cancel_confirmation = c_map.get("should_wait_order_cancel_confirmation")
         emergency_stop = c_map.get("emergency_stop").value
+        target_profit_pct = c_map.get("target_profit_pct").value / Decimal("100")
+        stop_loss_pct = c_map.get("stop_loss_pct").value / Decimal("100")
+        max_trades_per_minute = c_map.get("max_trades_per_minute").value
+        max_daily_loss_pct = c_map.get("max_daily_loss_pct").value / Decimal("100")
+        max_consecutive_losses = c_map.get("max_consecutive_losses").value
 
         strategy_logging_options = MicroProfitMakerStrategy.OPTION_LOG_ALL
         self.strategy = MicroProfitMakerStrategy()
@@ -140,6 +145,11 @@ async def start(self):
             should_wait_order_cancel_confirmation=should_wait_order_cancel_confirmation,
             moving_price_band=moving_price_band,
             emergency_stop=emergency_stop,
+            target_profit_pct=target_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+            max_trades_per_minute=max_trades_per_minute,
+            max_daily_loss_pct=max_daily_loss_pct,
+            max_consecutive_losses=max_consecutive_losses,
         )
     except Exception as e:
         self.notify(str(e))

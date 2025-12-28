@@ -447,6 +447,36 @@ micro_profit_maker_config_map = {
                   validator=validate_decimal_list),
 
     # --- risk controls ---
+    "target_profit_pct":
+        ConfigVar(key="target_profit_pct",
+                  prompt="Target profit per trade (%), e.g. 0.05 for 0.05% >>> ",
+                  type_str="decimal",
+                  default=Decimal("0.05"),
+                  validator=lambda v: validate_decimal(v, 0, 100, inclusive=False)),
+    "stop_loss_pct":
+        ConfigVar(key="stop_loss_pct",
+                  prompt="Stop loss per trade (%), e.g. 0.10 for 0.10% >>> ",
+                  type_str="decimal",
+                  default=Decimal("0.10"),
+                  validator=lambda v: validate_decimal(v, 0, 100, inclusive=False)),
+    "max_trades_per_minute":
+        ConfigVar(key="max_trades_per_minute",
+                  prompt="Maximum trade fills per minute >>> ",
+                  type_str="int",
+                  default=5,
+                  validator=lambda v: validate_int(v, min_value=1, inclusive=True)),
+    "max_daily_loss_pct":
+        ConfigVar(key="max_daily_loss_pct",
+                  prompt="Max daily loss (%), e.g. 1 for 1% >>> ",
+                  type_str="decimal",
+                  default=Decimal("1"),
+                  validator=lambda v: validate_decimal(v, 0, 100, inclusive=False)),
+    "max_consecutive_losses":
+        ConfigVar(key="max_consecutive_losses",
+                  prompt="Pause trading after N consecutive losses >>> ",
+                  type_str="int",
+                  default=3,
+                  validator=lambda v: validate_int(v, min_value=1, inclusive=True)),
     "emergency_stop":
         ConfigVar(key="emergency_stop",
                   prompt="Emergency stop (cancel all orders and halt trading)? (Yes/No) >>> ",
