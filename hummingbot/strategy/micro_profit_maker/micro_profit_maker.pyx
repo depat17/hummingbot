@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 from decimal import Decimal
 from math import ceil, floor
 from typing import Dict, List, Optional
@@ -145,6 +146,24 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         self._should_wait_order_cancel_confirmation = should_wait_order_cancel_confirmation
         self._moving_price_band = moving_price_band
         self.c_add_markets([market_info.market])
+
+        # --- micro_profit_maker behavior overrides ---
+        # Target fixed profit per round-trip trade: +0.05% (5 bps)
+        # Stop loss: -0.10% (10 bps)
+        # Max trade events: 5 fills per 60 seconds window
+        self._mfm_target_profit_pct = Decimal("0.0005")
+        self._mfm_stop_loss_pct = Decimal("0.0010")
+        self._mfm_max_trades_per_minute = 5
+        self._mfm_trade_timestamps = deque()
+
+        # Position state (keep inventory ~0 by allowing only one position at a time)
+        self._mfm_position_side = None  # TradeType.BUY (long) or TradeType.SELL (short)
+        self._mfm_entry_price = s_decimal_zero
+        self._mfm_position_amount = s_decimal_zero
+        self._mfm_entry_order_id = ""
+        self._mfm_exit_order_id = ""
+        self._mfm_stop_order_id = ""
+        self._mfm_stop_loss_in_progress = False
 
     def all_markets_ready(self):
         return all([market.ready for market in self._sb_markets])
@@ -693,6 +712,125 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
 
     # ---------------------------------------------------------------
 
+    cdef c_mfm_prune_trade_timestamps(self):
+        """
+        Maintain a rolling 60s window of fill timestamps for rate limiting.
+        """
+        cdef double cutoff = self._current_timestamp - 60.0
+        while len(self._mfm_trade_timestamps) > 0 and self._mfm_trade_timestamps[0] < cutoff:
+            self._mfm_trade_timestamps.popleft()
+
+    cdef bint c_mfm_rate_limit_allows_new_trade(self):
+        self.c_mfm_prune_trade_timestamps()
+        return len(self._mfm_trade_timestamps) < self._mfm_max_trades_per_minute
+
+    cdef bint c_mfm_spread_exceeds_total_fees_and_profit(self, ExchangeBase market, object top_bid, object top_ask):
+        """
+        Allow entries only when spread covers:
+        - total fees (buy + sell)
+        - plus the fixed profit target
+        """
+        cdef object mid
+        cdef object spread_pct
+        cdef object buy_fee
+        cdef object sell_fee
+        cdef object total_fee_pct
+
+        if top_bid.is_nan() or top_ask.is_nan() or top_bid <= 0 or top_ask <= 0 or top_ask <= top_bid:
+            return False
+
+        mid = (top_bid + top_ask) / Decimal("2")
+        if mid <= 0:
+            return False
+
+        spread_pct = (top_ask - top_bid) / mid
+
+        buy_fee = market.c_get_fee(self.base_asset, self.quote_asset, self._limit_order_type, TradeType.BUY,
+                                   self._order_amount, top_bid)
+        sell_fee = market.c_get_fee(self.base_asset, self.quote_asset, self._limit_order_type, TradeType.SELL,
+                                    self._order_amount, top_ask)
+        total_fee_pct = buy_fee.percent + sell_fee.percent
+
+        return spread_pct > total_fee_pct and spread_pct >= (total_fee_pct + self._mfm_target_profit_pct)
+
+    cdef c_mfm_cancel_all_active_non_hanging_orders(self):
+        for order in self.active_non_hanging_orders:
+            self.c_cancel_order(self._market_info, order.client_order_id)
+
+    cdef c_mfm_place_exit_order(self):
+        cdef:
+            ExchangeBase market = self._market_info.market
+            object exit_price
+            str order_id
+
+        if self._mfm_position_side is None or self._mfm_position_amount <= 0 or self._mfm_entry_price <= 0:
+            return
+        if self._mfm_exit_order_id != "" or self._mfm_stop_loss_in_progress:
+            return
+
+        if self._mfm_position_side is TradeType.BUY:
+            exit_price = self._mfm_entry_price * (Decimal("1") + self._mfm_target_profit_pct)
+            exit_price = market.c_quantize_order_price(self.trading_pair, exit_price)
+            order_id = self.c_sell_with_specific_market(
+                self._market_info,
+                self._mfm_position_amount,
+                order_type=self._limit_order_type,
+                price=exit_price,
+            )
+            self._mfm_exit_order_id = order_id
+        else:
+            exit_price = self._mfm_entry_price * (Decimal("1") - self._mfm_target_profit_pct)
+            exit_price = market.c_quantize_order_price(self.trading_pair, exit_price)
+            order_id = self.c_buy_with_specific_market(
+                self._market_info,
+                self._mfm_position_amount,
+                order_type=self._limit_order_type,
+                price=exit_price,
+            )
+            self._mfm_exit_order_id = order_id
+
+    cdef c_mfm_check_stop_loss_and_force_close(self):
+        cdef:
+            object mid_price
+            object stop_price
+            str order_id
+
+        if self._mfm_stop_loss_in_progress or self._mfm_position_side is None or self._mfm_position_amount <= 0:
+            return
+
+        mid_price = self.get_price()
+        if mid_price.is_nan() or mid_price <= 0:
+            return
+
+        if self._mfm_position_side is TradeType.BUY:
+            stop_price = self._mfm_entry_price * (Decimal("1") - self._mfm_stop_loss_pct)
+            if mid_price <= stop_price:
+                if self._mfm_exit_order_id != "":
+                    self.c_cancel_order(self._market_info, self._mfm_exit_order_id)
+                    self._mfm_exit_order_id = ""
+                order_id = self.c_sell_with_specific_market(
+                    self._market_info,
+                    self._mfm_position_amount,
+                    order_type=OrderType.MARKET,
+                    price=s_decimal_nan,
+                )
+                self._mfm_stop_order_id = order_id
+                self._mfm_stop_loss_in_progress = True
+        else:
+            stop_price = self._mfm_entry_price * (Decimal("1") + self._mfm_stop_loss_pct)
+            if mid_price >= stop_price:
+                if self._mfm_exit_order_id != "":
+                    self.c_cancel_order(self._market_info, self._mfm_exit_order_id)
+                    self._mfm_exit_order_id = ""
+                order_id = self.c_buy_with_specific_market(
+                    self._market_info,
+                    self._mfm_position_amount,
+                    order_type=OrderType.MARKET,
+                    price=s_decimal_nan,
+                )
+                self._mfm_stop_order_id = order_id
+                self._mfm_stop_loss_in_progress = True
+
     cdef c_start(self, Clock clock, double timestamp):
         StrategyBase.c_start(self, clock, timestamp)
         self._last_timestamp = timestamp
@@ -737,29 +875,61 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
                     self.logger().warning(f"WARNING: Some markets are not connected or are down at the moment. Market "
                                           f"making may be dangerous when markets or networks are unstable.")
 
-            proposal = None
-            if self._create_timestamp <= self._current_timestamp:
-                # 1. Create base order proposals
-                proposal = self.c_create_base_proposal()
-                # 2. Apply functions that limit numbers of buys and sells proposal
-                self.c_apply_order_levels_modifiers(proposal)
-                # 3. Apply functions that modify orders price
-                self.c_apply_order_price_modifiers(proposal)
-                # 4. Apply functions that modify orders size
-                self.c_apply_order_size_modifiers(proposal)
-                # 5. Apply budget constraint, i.e. can't buy/sell more than what you have.
-                self.c_apply_budget_constraint(proposal)
+            # --- micro_profit_maker custom loop ---
+            self.c_mfm_prune_trade_timestamps()
 
-                if not self._take_if_crossed:
-                    self.c_filter_out_takers(proposal)
+            if self._mfm_position_side is not None:
+                # Manage existing position: ensure TP exists and enforce SL
+                if self._mfm_exit_order_id != "" and self._mfm_exit_order_id not in [o.client_order_id for o in self.active_orders]:
+                    # Exit order no longer active (canceled/failed) - allow re-creation
+                    self._mfm_exit_order_id = ""
+                self.c_mfm_check_stop_loss_and_force_close()
+                self.c_mfm_place_exit_order()
+                return
 
-            self._hanging_orders_tracker.process_tick()
+            # Flat: allow at most one resting entry order; otherwise cancel leftovers
+            if self._mfm_entry_order_id != "" and self._mfm_entry_order_id not in [o.client_order_id for o in self.active_orders]:
+                # Entry order no longer active (canceled/failed)
+                self._mfm_entry_order_id = ""
 
-            self.c_cancel_active_orders_on_max_age_limit()
-            self.c_cancel_active_orders(proposal)
-            self.c_cancel_orders_below_min_spread()
-            if self.c_to_create_orders(proposal):
-                self.c_execute_orders_proposal(proposal)
+            if len(self.active_non_hanging_orders) > 0:
+                if (self._mfm_entry_order_id != "" and
+                        len(self.active_non_hanging_orders) == 1 and
+                        self.active_non_hanging_orders[0].client_order_id == self._mfm_entry_order_id):
+                    # Wait for the current entry to fill
+                    return
+                # Unexpected/stale orders while flat: cancel to avoid accumulating inventory
+                self._mfm_entry_order_id = ""
+                self.c_mfm_cancel_all_active_non_hanging_orders()
+                return
+
+            # Respect trade rate limit
+            if not self.c_mfm_rate_limit_allows_new_trade():
+                return
+
+            # Entry conditions: spread covers fees + profit target
+            market = self._market_info.market
+            top_bid = market.c_get_price(self.trading_pair, False)
+            top_ask = market.c_get_price(self.trading_pair, True)
+            if not self.c_mfm_spread_exceeds_total_fees_and_profit(market, top_bid, top_ask):
+                return
+
+            # Inventory near zero: if we already hold base, prefer selling; otherwise prefer buying.
+            base_bal = market.c_get_available_balance(self.base_asset)
+            if base_bal > (self._order_amount * Decimal("0.5")):
+                self._mfm_entry_order_id = self.c_sell_with_specific_market(
+                    self._market_info,
+                    self._order_amount,
+                    order_type=self._limit_order_type,
+                    price=market.c_quantize_order_price(self.trading_pair, top_ask),
+                )
+            else:
+                self._mfm_entry_order_id = self.c_buy_with_specific_market(
+                    self._market_info,
+                    self._order_amount,
+                    order_type=self._limit_order_type,
+                    price=market.c_quantize_order_price(self.trading_pair, top_bid),
+                )
         finally:
             self._last_timestamp = timestamp
 
@@ -1060,6 +1230,10 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
             object market_info = self._sb_order_tracker.c_get_shadow_market_pair_from_order_id(order_id)
             tuple order_fill_record
 
+        # Count fills for rate limiting (max 5 trade events per minute)
+        self._mfm_trade_timestamps.append(self._current_timestamp)
+        self.c_mfm_prune_trade_timestamps()
+
         if market_info is not None:
             limit_order_record = self._sb_order_tracker.c_get_shadow_limit_order(order_id)
             order_fill_record = (limit_order_record, order_filled_event)
@@ -1086,6 +1260,40 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         cdef:
             str order_id = order_completed_event.order_id
             limit_order_record = self._sb_order_tracker.c_get_limit_order(self._market_info, order_id)
+        # --- micro_profit_maker position state management ---
+        # Stop-loss forced close for SHORT positions uses a MARKET BUY
+        if self._mfm_stop_order_id != "" and order_id == self._mfm_stop_order_id:
+            self._mfm_stop_order_id = ""
+            self._mfm_stop_loss_in_progress = False
+            self._mfm_position_side = None
+            self._mfm_entry_price = s_decimal_zero
+            self._mfm_position_amount = s_decimal_zero
+            self._mfm_entry_order_id = ""
+            self._mfm_exit_order_id = ""
+            return
+
+        # Exit for SHORT positions is a BUY
+        if self._mfm_exit_order_id != "" and order_id == self._mfm_exit_order_id and self._mfm_position_side is TradeType.SELL:
+            self._mfm_position_side = None
+            self._mfm_entry_price = s_decimal_zero
+            self._mfm_position_amount = s_decimal_zero
+            self._mfm_entry_order_id = ""
+            self._mfm_exit_order_id = ""
+            self._mfm_stop_loss_in_progress = False
+            return
+
+        # Entry BUY opens a LONG position, then we place a take-profit SELL
+        if self._mfm_entry_order_id != "" and order_id == self._mfm_entry_order_id and self._mfm_position_side is None:
+            if limit_order_record is not None:
+                self._mfm_position_side = TradeType.BUY
+                self._mfm_entry_price = limit_order_record.price
+                self._mfm_position_amount = limit_order_record.quantity
+                self._mfm_entry_order_id = ""
+                self._mfm_exit_order_id = ""
+                self._mfm_stop_loss_in_progress = False
+                self.c_mfm_cancel_all_active_non_hanging_orders()
+                self.c_mfm_place_exit_order()
+
         if limit_order_record is None:
             return
         active_sell_ids = [x.client_order_id for x in self.active_orders if not x.is_buy]
@@ -1127,6 +1335,40 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
         cdef:
             str order_id = order_completed_event.order_id
             LimitOrder limit_order_record = self._sb_order_tracker.c_get_limit_order(self._market_info, order_id)
+        # --- micro_profit_maker position state management ---
+        # Stop-loss forced close for LONG positions uses a MARKET SELL
+        if self._mfm_stop_order_id != "" and order_id == self._mfm_stop_order_id:
+            self._mfm_stop_order_id = ""
+            self._mfm_stop_loss_in_progress = False
+            self._mfm_position_side = None
+            self._mfm_entry_price = s_decimal_zero
+            self._mfm_position_amount = s_decimal_zero
+            self._mfm_entry_order_id = ""
+            self._mfm_exit_order_id = ""
+            return
+
+        # Exit for LONG positions is a SELL
+        if self._mfm_exit_order_id != "" and order_id == self._mfm_exit_order_id and self._mfm_position_side is TradeType.BUY:
+            self._mfm_position_side = None
+            self._mfm_entry_price = s_decimal_zero
+            self._mfm_position_amount = s_decimal_zero
+            self._mfm_entry_order_id = ""
+            self._mfm_exit_order_id = ""
+            self._mfm_stop_loss_in_progress = False
+            return
+
+        # Entry SELL opens a SHORT position, then we place a take-profit BUY
+        if self._mfm_entry_order_id != "" and order_id == self._mfm_entry_order_id and self._mfm_position_side is None:
+            if limit_order_record is not None:
+                self._mfm_position_side = TradeType.SELL
+                self._mfm_entry_price = limit_order_record.price
+                self._mfm_position_amount = limit_order_record.quantity
+                self._mfm_entry_order_id = ""
+                self._mfm_exit_order_id = ""
+                self._mfm_stop_loss_in_progress = False
+                self.c_mfm_cancel_all_active_non_hanging_orders()
+                self.c_mfm_place_exit_order()
+
         if limit_order_record is None:
             return
         active_buy_ids = [x.client_order_id for x in self.active_orders if x.is_buy]

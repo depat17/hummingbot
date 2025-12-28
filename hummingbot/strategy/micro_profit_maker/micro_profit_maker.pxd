@@ -59,6 +59,21 @@ cdef class MicroProfitMakerStrategy(StrategyBase):
 
         object _moving_price_band
 
+        # --- micro_profit_maker custom logic state ---
+        object _mfm_target_profit_pct
+        object _mfm_stop_loss_pct
+        int _mfm_max_trades_per_minute
+        object _mfm_trade_timestamps
+
+        object _mfm_position_side
+        object _mfm_entry_price
+        object _mfm_position_amount
+
+        str _mfm_entry_order_id
+        str _mfm_exit_order_id
+        str _mfm_stop_order_id
+        bint _mfm_stop_loss_in_progress
+
     cdef object c_get_mid_price(self)
     cdef object c_create_base_proposal(self)
     cdef tuple c_get_adjusted_available_balance(self, list orders)
